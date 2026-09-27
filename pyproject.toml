@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "capacity-planner"
+version = "0.1.0"
+description = "Compute capacity planning: forecast demand, simulate allocation, price cost-vs-SLO tradeoffs"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
