@@ -148,6 +148,46 @@ each job is counted exactly once. `spot_fleet` stamps out discounted
 preemptible copies of a template; `sweep_mixes` takes
 `{label: (factory, count)}` mixes and returns one tradeoff point each.
 
+## Priority preemption
+
+Strict priority queues protect ordering but not latency: a high-priority
+job that arrives during congestion still waits behind running low-priority
+work. With `Simulator(..., preemption_enabled=True)`, a queued head job
+that cannot be placed may **displace running jobs of strictly lower
+priority** to free capacity on one machine:
+
+```bash
+python examples/priority_preemption.py
+```
+
+This runs one congested fleet twice — preemption off vs on — over a
+workload of 18 low-priority bulk jobs plus 4 high-priority VIP jobs
+arriving mid-congestion with a tight 2h wait deadline. Output:
+`examples/priority_preemption.png` — breach rate per priority class, off
+vs on.
+
+How to read it: with preemption off, every VIP breaches (100%) — the
+fleet is full of bulk work when they arrive. With preemption on, VIP
+breach collapses to 0% (average wait 0.00h) at the price of 4
+preemptions; the bulk class pays only +0.33h of average wait and no extra
+breaches, and fleet cost is identical ($72 over the shared 24h horizon).
+In this workload the displacement is nearly free because wait deadlines
+govern queue time only — a displaced running job finishes an hour later
+but never "breaches". With tighter bulk deadlines or longer VIP
+durations, the bulk class would pay more visibly.
+
+Policy (all in the `simulator.py` docstring): only the queue head may
+preempt, so strict priority ordering is never violated; victims are
+chosen lowest-priority-first, tie-broken by largest CPU footprint, then
+longest remaining time, and the smallest victim set across machines wins.
+Displaced jobs **checkpoint** — they resume with their remaining (not
+full) duration, keep their original arrival for deadline accounting, and
+rejoin the queue (one already past its deadline is rejected immediately).
+A job displaced `MAX_PREEMPTIONS_PER_JOB` (2) times becomes immune and
+runs to completion, which bounds chains and prevents ping-pong.
+Utilization counts every executed hour exactly once. Preemption is
+**off by default**, so existing runs reproduce bit-for-bit.
+
 ## Status
 
 Working end to end: synthetic diurnal workloads, discrete-event

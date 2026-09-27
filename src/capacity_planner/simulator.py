@@ -48,6 +48,23 @@ Simulator semantics (the contract tests pin down):
   than the job can complete, evict/requeue cycles continue indefinitely —
   keep deadlines finite (or revocation rates realistic) so every run
   terminates.
+- Priority preemption (opt-in via `Simulator(preemption_enabled=True)`):
+  during the queue drain, a head job that cannot be placed may displace
+  running jobs of strictly lower priority to free capacity on one machine.
+  Victims are chosen lowest-priority-first, tie-broken by largest CPU
+  footprint (fewest victims per freed unit of capacity), and the smallest victim
+  set across machines wins. Displaced jobs checkpoint: their remaining
+  (not full) duration is preserved, they keep their original arrival for
+  deadline accounting, and they rejoin the queue — a job already past its
+  deadline at displacement is rejected immediately. A job displaced
+  MAX_PREEMPTIONS_PER_JOB times becomes immune and runs to completion,
+  which bounds preemption chains and prevents ping-pong. Preemption is
+  attempted only for the queue head, so strict priority ordering is never
+  violated. Utilization counts every executed hour exactly once: elapsed
+  work stays charged, the un-run portion is re-charged on resume. The
+  schedule records one entry per admitted job — the first admission for
+  preempted jobs (so waits measure time to first admission), the final
+  successful run for evicted jobs — and a resumed job is never re-admitted.
 - makespan = t_end - t_start, where t_start is the first event time. Idle
   time before the workload starts is not charged to the fleet, so fleet
   configurations are comparable like-for-like.
@@ -134,13 +151,30 @@ class Machine:
         self.free_cpu -= job.cpu
         self.free_ram -= job.ram
         self.free_gpu -= job.gpu
-        self.used_cpu_hours += job.cpu * job.duration
-        self.used_ram_hours += job.ram * job.duration
-        self.used_gpu_hours += job.gpu * job.duration
+        # Utilization is charged on remaining time: a resumed job was
+        # already charged for its elapsed portion at its first placement.
+        self.used_cpu_hours += job.cpu * job.remaining
+        self.used_ram_hours += job.ram * job.remaining
+        self.used_gpu_hours += job.gpu * job.remaining
         self.peak_cpu = max(self.peak_cpu, self.cpu - self.free_cpu)
         self.peak_ram = max(self.peak_ram, self.ram - self.free_ram)
         self.peak_gpu = max(self.peak_gpu, self.gpu - self.free_gpu)
+        job.run_start = t
         self._running[id(job)] = (job, attempt)
+
+    def preempt(self, job: "Job", t: float) -> None:
+        """Displace a running job for priority preemption: free its capacity
+        and checkpoint its progress. Unlike eviction (revocation), the
+        elapsed work stays in the utilization accounting — only the
+        not-yet-run portion is subtracted here, and it is charged again when
+        the job resumes, so every executed hour counts exactly once."""
+        unrun = job.remaining - (t - job.run_start)
+        self.release(job)
+        self.used_cpu_hours -= job.cpu * unrun
+        self.used_ram_hours -= job.ram * unrun
+        self.used_gpu_hours -= job.gpu * unrun
+        job.remaining = unrun
+        self._untrack(job)
 
     def release(self, job: "Job") -> None:
         self.free_cpu += job.cpu
@@ -193,6 +227,22 @@ class Job:
     duration: float = 1.0  # hours of wall-clock hold time
     wait_deadline: float = float("inf")  # max hours willing to wait in queue
     priority: int = 0  # lower number = scheduled first when draining the queue
+    # Runtime state (managed by Simulator; reset on every run). `remaining`
+    # is the wall-clock still needed: preemption checkpoints progress, so a
+    # preempted job resumes with its remaining time, not its full duration.
+    # `preemptions` counts how often the job was displaced (starvation guard).
+    # `run_start` is when the current attempt began.
+    preemptions: int = field(init=False, default=0)
+    remaining: float = field(init=False, default=0.0)
+    run_start: float = field(init=False, default=0.0)
+    # Set on first admission; a resumed (preempted) job is not re-admitted,
+    # so the schedule holds one entry per job and waits stay true queue
+    # waits. Reset when the job is evicted, so its final successful run is
+    # recorded under the eviction convention.
+    started: bool = field(init=False, default=False)
+
+    def __post_init__(self) -> None:
+        self.remaining = self.duration
 
 
 RejectionReason = Literal["hopeless", "deadline", "stranded-at-end"]
@@ -214,7 +264,9 @@ class Eviction:
 
 @dataclass
 class SimulationResult:
-    scheduled: list[tuple[Job, str, float]]  # (job, machine_name, start_time)
+    scheduled: list[tuple[Job, str, float]]  # (job, machine_name, start_time),
+    # one entry per admitted job: first admission (preempted jobs are a
+    # continuation, not a re-admission); evicted jobs re-record on retry
     rejections: list[Rejection]
     wait_times: list[float]  # admitted-job waits, in schedule order
     utilization: dict[str, dict[str, float]]  # machine -> resource -> [0,1]
@@ -222,6 +274,9 @@ class SimulationResult:
     t_start: float = 0.0  # time of the first event
     t_end: float = 0.0  # time of the last meaningful event (arrival,
     # completion, or rejection — no-op expiry checks don't extend the window)
+    # Appended last: inserting a defaulted field mid-dataclass would shift
+    # positional construction for existing callers.
+    n_preemptions: int = 0  # priority preemptions performed (0 unless enabled)
 
     @property
     def makespan(self) -> float:
@@ -306,6 +361,11 @@ _PHASE_RECOVER = 2
 _PHASE_ARRIVAL = 3
 _PHASE_EXPIRE = 4
 
+# Starvation guard for priority preemption: a job displaced this many times
+# becomes immune and runs to completion (or expires) — this bounds
+# preemption chains and prevents ping-pong between priority classes.
+MAX_PREEMPTIONS_PER_JOB = 2
+
 
 class Simulator:
     """Strict-priority allocator over a fixed fleet, with optional preemptible
@@ -323,16 +383,31 @@ class Simulator:
     Preemptible machines are revoked as a Poisson process with their
     `revocation_rate`; pass `seed` for reproducible revocation times (the
     seed is re-applied on every run, so repeat runs of one Simulator agree).
+
+    Priority preemption is off by default. With `preemption_enabled=True`,
+    a queued job that cannot be placed may displace running jobs of
+    strictly lower priority (see the module docstring for the policy).
     """
 
-    def __init__(self, machines: list[Machine], seed: int | None = None):
+    def __init__(
+        self,
+        machines: list[Machine],
+        seed: int | None = None,
+        preemption_enabled: bool = False,
+    ):
         names = [m.name for m in machines]
         if len(set(names)) != len(names):
             raise ValueError(f"duplicate machine names: {names}")
         for m in machines:
             _validate_machine(m)
+        if not isinstance(preemption_enabled, bool):
+            raise ValueError(
+                "preemption_enabled must be a bool, "
+                f"got {preemption_enabled!r}"
+            )
         self.machines = machines
         self._seed = seed
+        self.preemption_enabled = preemption_enabled
 
     def run(self, jobs: list[Job]) -> SimulationResult:
         for job in jobs:
@@ -343,9 +418,17 @@ class Simulator:
                 "distinct object (attempt tracking keys on identity)"
             )
         # Fresh per-run state: the seed is re-applied so repeat runs of one
-        # Simulator reproduce the same revocation schedule.
+        # Simulator reproduce the same revocation schedule, and job runtime
+        # state (remaining time, preemption count) is reset so a workload
+        # object can be re-run.
         self._seq = itertools.count()
         self._attempt = itertools.count()
+        n_preemptions = 0
+        for job in jobs:
+            job.preemptions = 0
+            job.remaining = job.duration
+            job.run_start = 0.0
+            job.started = False
         # Dedicated RNG for the revocation process: same seed -> same
         # revocation times, so spot experiments are reproducible.
         self._rng = random.Random(self._seed)
@@ -392,27 +475,130 @@ class Simulator:
                     heapq.heappush(
                         events,
                         (
-                            t + job.duration,
+                            t + job.remaining,
                             _PHASE_COMPLETE,
                             next(self._seq),
                             "complete",
                             (m, job, attempt),
                         ),
                     )
-                    scheduled.append((job, m.name, t))
-                    wait_times.append(t - job.arrival)
+                    if not job.started:
+                        # First admission only: a resumed (preempted) job is
+                        # a continuation, not a new admission — recording it
+                        # again would double-count the job in SLO stats and
+                        # mislabel execution time as wait.
+                        job.started = True
+                        scheduled.append((job, m.name, t))
+                        wait_times.append(t - job.arrival)
                     return True
             return False
 
         def drain_queue(t: float) -> None:
             # Strict priority: head-of-line blocking, no backfill. If the
-            # head job cannot be placed, nothing behind it is tried.
+            # head job cannot be placed, nothing behind it is tried — unless
+            # priority preemption is enabled, in which case the head may
+            # displace strictly-lower-priority running jobs (see below).
             queue.sort(key=lambda j: (j.priority, j.arrival))
             while queue:
                 if try_place(queue[0], t):
                     del queue[0]
+                    continue
+                if self.preemption_enabled and preempt_for(queue[0], t):
+                    # Victims were displaced and requeued; the head is
+                    # guaranteed to fit on the freed machine now, so the
+                    # next loop iteration places it. Re-sort because the
+                    # requeued victims may interleave with the queue.
+                    queue.sort(key=lambda j: (j.priority, j.arrival))
+                    continue
+                break
+
+        def find_victims(
+            head: Job, t: float
+        ) -> tuple[Machine, list[Job]] | None:
+            """Victim set letting `head` start at time t, or None.
+
+            Only running jobs of strictly lower priority (larger priority
+            number) that have not hit the preemption cap are candidates.
+            Within one machine, candidates are taken lowest-priority-first,
+            tie-broken by largest CPU footprint (frees the most common
+            binding resource per victim), then longest remaining time;
+            accumulation stops as soon as the head fits. Across machines
+            the smallest victim set wins. Returns None when no machine can
+            host the head even after displacing every eligible job on it.
+            """
+            best: tuple[Machine, list[Job]] | None = None
+            for m in self.machines:
+                if t < m.unavailable_until or m.fits(head, t):
+                    continue
+                candidates = [
+                    job
+                    for job, _ in m._running.values()
+                    if job.priority > head.priority
+                    and job.preemptions < MAX_PREEMPTIONS_PER_JOB
+                ]
+                # Live remaining time: `job.remaining` is only refreshed on
+                # preemption, so subtract the elapsed part of the current
+                # attempt.
+                candidates.sort(
+                    key=lambda j: (
+                        -j.priority,
+                        -j.cpu,
+                        -(j.remaining - (t - j.run_start)),
+                    )
+                )
+                victims: list[Job] = []
+                freed_cpu = freed_ram = freed_gpu = 0.0
+                for job in candidates:
+                    victims.append(job)
+                    freed_cpu += job.cpu
+                    freed_ram += job.ram
+                    freed_gpu += job.gpu
+                    if (
+                        m.free_cpu + freed_cpu >= head.cpu
+                        and m.free_ram + freed_ram >= head.ram
+                        and m.free_gpu + freed_gpu >= head.gpu
+                    ):
+                        break
                 else:
-                    break
+                    continue  # this machine can never host the head
+                if best is None or len(victims) < len(best[1]):
+                    best = (m, victims)
+            return best
+
+        def preempt_for(head: Job, t: float) -> bool:
+            """Displace a victim set so `head` can start at t. Displaced
+            jobs checkpoint their progress (remaining time is preserved),
+            keep their original arrival for deadline accounting, and rejoin
+            the queue; one already past its deadline is rejected now. A
+            job displaced MAX_PREEMPTIONS_PER_JOB times is immune."""
+            found = find_victims(head, t)
+            if found is None:
+                return False
+            nonlocal n_preemptions
+            m, victims = found
+            for job in victims:
+                m.preempt(job, t)
+                job.preemptions += 1
+                n_preemptions += 1
+                if (
+                    math.isfinite(job.wait_deadline)
+                    and t - job.arrival > job.wait_deadline
+                ):
+                    rejections.append(Rejection(job, "deadline", t))
+                else:
+                    queue.append(job)
+                    if math.isfinite(job.wait_deadline):
+                        heapq.heappush(
+                            events,
+                            (
+                                job.arrival + job.wait_deadline,
+                                _PHASE_EXPIRE,
+                                next(self._seq),
+                                "expire",
+                                job,
+                            ),
+                        )
+            return True
 
         def dequeue(job: Job) -> bool:
             for i, q in enumerate(queue):
@@ -465,6 +651,9 @@ class Simulator:
                 m.evict(job)
                 evictions.append(Eviction(job=job, machine=m.name, time=t))
                 remove_placement(job)
+                # The eviction convention records only the final successful
+                # run: clearing `started` lets the retry re-admit itself.
+                job.started = False
                 if (
                     math.isfinite(job.wait_deadline)
                     and t - job.arrival > job.wait_deadline
@@ -610,6 +799,7 @@ class Simulator:
             wait_times=wait_times,
             utilization=utilization,
             evictions=evictions,
+            n_preemptions=n_preemptions,
             t_start=t_start,
             t_end=t_end,
         )
