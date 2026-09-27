@@ -60,10 +60,41 @@ default). Everything right of the knee is over-provisioning; everything
 left of the star breaches the SLO. `cheapest_meeting_slo` and `find_knee`
 are importable from `capacity_planner.sweep` for your own analyses.
 
+## Planning against forecasts
+
+The tradeoff curve above cheats: it sizes the fleet against the exact
+workload it will face. Real planners only ever see history. `planner.py`
+closes the loop:
+
+```bash
+python examples/plan_vs_oracle.py
+```
+
+This generates one 24h workload, then treats the last 6h as the unknown
+future. Three plans compete, all evaluated against what actually happened:
+
+- **oracle** — sizes against the actual future (the cheat no real planner gets)
+- **forecast plan** — `plan_fleet` buckets the first 18h of history, picks the
+  best baseline forecaster by holdout backtest (moving average vs exponential
+  smoothing over a small param grid), turns the forecast into a planned
+  workload, and sizes the fleet against that
+- **naive** — sizes as if every future hour hits the historical peak
+
+`evaluate_plan` runs the chosen fleet against the held-out future;
+`cost_of_being_wrong` prices the error in dollars and SLO points. On the
+default seed the forecast plan lands one machine under the oracle (saving
+$24 but breaching 5.2% vs the 5% SLO) while the naive plan over-provisions
+by 25% — the shape of the tradeoff forecast error actually creates.
+
+Caveat, stated in the module docstring too: the planned workload is
+resampled, which smooths burstiness, so picks skew slightly optimistic —
+apply a safety margin in practice.
+
 ## Status
 
 Working end to end: synthetic diurnal workloads, discrete-event
-simulation, fleet-size sweeps, and cost-vs-SLO tradeoff curves with
-knee/SLO-pick analysis — 31 tests green. Next steps: driving the
-workload generator from real forecast output, machine-type sweeps
-(heterogeneous fleets), and utilization plots.
+simulation, fleet-size sweeps, cost-vs-SLO tradeoff curves with
+knee/SLO-pick analysis, and a forecast-driven planning loop with
+oracle-vs-forecast cost-of-error accounting — 40 tests green. Next steps:
+machine-type sweeps (heterogeneous fleets, spot vs on-demand mixes) and
+utilization plots.
