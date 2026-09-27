@@ -36,6 +36,34 @@ print(tradeoff_point(fleet, result))  # per-job deadlines; pass wait_deadline=..
 print(tradeoff_point(fleet, result, horizon=24.0))  # shared horizon for like-for-like fleet comparisons
 ```
 
+## Tradeoff curve
+
+The decision artifact: sweep fleet sizes against one workload and plot cost vs SLO breach rate.
+
+```bash
+pip install -e ".[viz]"          # matplotlib for the plot
+python examples/tradeoff_curve.py
+```
+
+This generates a seeded 24h workload (`workload.py`: sinusoidal diurnal
+arrivals via Poisson thinning, mixed small/medium/large/gpu job classes),
+sweeps fleets of 2–16 identical machines (`sweep.py`, one
+`tradeoff_point` per size over a shared 24h horizon so cost is
+like-for-like), and writes `examples/tradeoff.csv` plus
+`examples/tradeoff.png`.
+
+How to read the curve: x-axis is fleet cost over the horizon, y-axis is
+SLO breach rate. The **knee** (circled, max-curvature point) is where
+adding machines stops buying much SLO — the economic sweet spot. The
+**star** is the cheapest fleet meeting the breach-rate SLO (5% by
+default). Everything right of the knee is over-provisioning; everything
+left of the star breaches the SLO. `cheapest_meeting_slo` and `find_knee`
+are importable from `capacity_planner.sweep` for your own analyses.
+
 ## Status
 
-Early scaffold: the core loop works and is tested. Next steps are a real demand generator from the forecast, fleet-size sweep tooling, and utilization plots.
+Working end to end: synthetic diurnal workloads, discrete-event
+simulation, fleet-size sweeps, and cost-vs-SLO tradeoff curves with
+knee/SLO-pick analysis — 31 tests green. Next steps: driving the
+workload generator from real forecast output, machine-type sweeps
+(heterogeneous fleets), and utilization plots.

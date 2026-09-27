@@ -13,3 +13,4 @@ where = ["src"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+viz = ["matplotlib>=3"]
