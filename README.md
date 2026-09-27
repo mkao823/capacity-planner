@@ -12,9 +12,9 @@ This is the same shape as allocating stock to satisfy supply and demand: finite 
 
 Three stages, wired end to end:
 
-1. **Forecast** (`forecast.py`) — turn a history of job arrivals into a forward demand curve. Starts with honest baselines (moving average, exponential smoothing); an adapter slot is stubbed for a real statistical model.
-2. **Simulate** (`simulator.py`) — a discrete-event allocator over a fixed fleet. Jobs arrive, get placed on machines with free capacity, queue when the fleet is full (drained by priority, then arrival order), and are rejected when they can't ever fit or wait past their deadline. Records utilization, wait times, and rejections.
-3. **Price** (`cost.py`) — turn a simulated schedule into dollars and SLO stats. Sweep fleet sizes, collect one `tradeoff_point` per configuration, and you have the cost-vs-breach-rate curve a capacity decision is actually made on.
+1. **Forecast** (`forecast.py`) — turn a history of job arrivals into a forward demand curve. Starts with honest baselines (moving average, exponential smoothing); an adapter slot is stubbed for a real statistical model. `bucket_arrivals` validates inputs (bucket size first, even for empty input) and accepts an optional `end_time` so trailing zero-demand buckets are representable.
+2. **Simulate** (`simulator.py`) — a discrete-event allocator over a fixed fleet. Every arrival joins a single queue drained by one allocator (immediate placement is just the empty-queue case — arrivals never jump the queue). Each timestamp runs in phases: completions release capacity, then arrivals enqueue, then the queue drains once, then deadline expiries fire. The drain is strict priority order — `(priority, arrival)` with head-of-line blocking, no backfilling — so a smaller job never sneaks past a blocked higher-priority one. Jobs that can't ever fit are rejected `hopeless` at arrival; queued jobs get an explicit expiry event and are rejected `deadline` at the deadline itself; anything left when the event stream ends is `stranded-at-end`. `makespan = t_end − t_start`, so pre-workload idle time isn't charged to the fleet.
+3. **Price** (`cost.py`) — turn a simulated schedule into dollars and SLO stats. Sweep fleet sizes, collect one `tradeoff_point` per configuration, and you have the cost-vs-breach-rate curve a capacity decision is actually made on. SLOs are measured per job against its own `wait_deadline` by default (pass a global `wait_deadline` to override); rejected jobs always count as breaches, and `avg/p95_wait_admitted` are admitted-job latency only. p95 uses a nearest-rank percentile that stays within the observed range on small samples.
 
 ## Quickstart
 
@@ -32,7 +32,8 @@ from capacity_planner.cost import tradeoff_point
 fleet = [Machine("gpu-node", cpu=16, ram=64, gpu=2, cost_per_hour=4.0)]
 jobs = [Job("infer-1", arrival=0.0, cpu=4, ram=16, gpu=1, duration=0.5, wait_deadline=0.1)]
 result = Simulator(fleet).run(jobs)
-print(tradeoff_point(fleet, result, wait_deadline=0.1))
+print(tradeoff_point(fleet, result))  # per-job deadlines; pass wait_deadline=... to override
+print(tradeoff_point(fleet, result, horizon=24.0))  # shared horizon for like-for-like fleet comparisons
 ```
 
 ## Status

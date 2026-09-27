@@ -7,16 +7,48 @@ honest baselines. A fancier model adapter slot is stubbed below.
 
 from __future__ import annotations
 
+import math
 
-def bucket_arrivals(arrivals: list[float], bucket_size: float) -> list[int]:
-    """Count arrivals per fixed-size time bucket (hours)."""
-    if not arrivals:
-        return []
-    if bucket_size <= 0:
-        raise ValueError("bucket_size must be positive")
-    n_buckets = int(max(arrivals) // bucket_size) + 1
+
+def _check_arrival_time(t: object) -> float:
+    if isinstance(t, bool) or not isinstance(t, (int, float)):
+        raise ValueError(f"arrivals must be numbers, got {t!r}")
+    v = float(t)
+    if math.isnan(v) or math.isinf(v):
+        raise ValueError(f"arrivals must be finite, got {t!r}")
+    if v < 0:
+        raise ValueError(f"arrivals must be non-negative, got {t!r}")
+    return v
+
+
+def bucket_arrivals(
+    arrivals: list[float], bucket_size: float, end_time: float | None = None
+) -> list[int]:
+    """Count arrivals per fixed-size time bucket (hours).
+
+    `end_time` optionally extends the bucket range so trailing zero-demand
+    buckets are representable (e.g. planning a window that outlasts the last
+    observed arrival). Negative or non-finite arrival times raise ValueError
+    instead of silently wrapping into the wrong bucket.
+    """
+    if (
+        isinstance(bucket_size, bool)
+        or not isinstance(bucket_size, (int, float))
+        or math.isnan(bucket_size)
+        or math.isinf(bucket_size)
+        or bucket_size <= 0
+    ):
+        raise ValueError(f"bucket_size must be a positive finite number, got {bucket_size!r}")
+    if end_time is not None:
+        end_time = _check_arrival_time(end_time)
+    times = [_check_arrival_time(t) for t in arrivals]
+    n_buckets = 0
+    if times:
+        n_buckets = int(max(times) // bucket_size) + 1
+    if end_time is not None:
+        n_buckets = max(n_buckets, int(end_time // bucket_size) + 1)
     counts = [0] * n_buckets
-    for t in arrivals:
+    for t in times:
         counts[int(t // bucket_size)] += 1
     return counts
 

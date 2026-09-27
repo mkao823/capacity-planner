@@ -77,12 +77,16 @@ def test_cost_and_slo_stats_are_consistent():
 
     stats = slo_stats(result, wait_deadline=1.0)
     assert 0.0 <= stats["breach_rate"] <= 1.0
-    assert stats["avg_wait"] >= 0
-    assert stats["p95_wait"] >= stats["avg_wait"] or result.n_scheduled <= 1
+    assert stats["avg_wait_admitted"] >= 0
+    # p95 is a nearest-rank percentile: always within [min, max] of waits.
+    assert 0.0 <= stats["p95_wait_admitted"] <= max(result.wait_times)
 
     point = tradeoff_point(machines, result, wait_deadline=1.0)
     assert point["cost"] == cost
     assert point["breach_rate"] == stats["breach_rate"]
+    # Default horizon is the result makespan.
+    assert point["horizon"] == result.makespan
+    assert point["makespan"] == result.makespan
 
 
 def test_forecast_baselines():
