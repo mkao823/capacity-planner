@@ -3,7 +3,9 @@
 
 Generates one 24h workload, then pretends the last 6h are the unknown future:
   - oracle:  sizes the fleet against the actual future workload (the cheat)
-  - forecast: sizes the fleet from a forecast fit on the first 18h of history
+  - forecast (no margin): sizes the fleet from a forecast fit on history
+  - forecast + p90: same, but plans against the p90 residual margin
+  - forecast + 20%: same, but with a flat +20% safety factor
   - naive:   sizes the fleet as if every future hour hits the historical peak
 
 Each plan is evaluated against the actual future. Writes:
@@ -67,18 +69,41 @@ def main() -> None:
     )
     oracle = cheapest_meeting_slo(oracle_points, SLO_MAX_BREACH)
 
-    # Forecast plan: history -> forecast -> planned workload -> fleet pick,
-    # then evaluated against what actually happened.
-    plan = plan_fleet(
+    # Forecast plans: history -> forecast -> planned workload -> fleet pick,
+    # then evaluated against what actually happened. Three variants against
+    # the same held-out future: no margin, p90 residual margin, flat +20%.
+    plan_none = plan_fleet(
         history, factory, SIZES, FUTURE_HOURS, SLO_MAX_BREACH,
         bucket_size=BUCKET, seed=SEED,
     )
-    print(
-        f"forecaster: {plan['forecaster']}{plan['forecaster_params']} "
-        f"(backtest MAE {plan['backtest_mae']:.2f} jobs/bucket)"
+    plan_p90 = plan_fleet(
+        history, factory, SIZES, FUTURE_HOURS, SLO_MAX_BREACH,
+        bucket_size=BUCKET, seed=SEED, margin_quantile=0.9,
     )
-    realized = evaluate_plan(
-        plan["n_machines"], factory, actual, FUTURE_HOURS
+    plan_sf = plan_fleet(
+        history, factory, SIZES, FUTURE_HOURS, SLO_MAX_BREACH,
+        bucket_size=BUCKET, seed=SEED, safety_factor=0.2,
+    )
+    for label, plan in (
+        ("no margin", plan_none),
+        ("p90 margin", plan_p90),
+        ("+20% factor", plan_sf),
+    ):
+        print(
+            f"forecaster ({label}): {plan['forecaster']}{plan['forecaster_params']} "
+            f"(backtest MAE {plan['backtest_mae']:.2f} jobs/bucket, "
+            f"margin +{plan['margin_jobs_per_bucket']:.2f} jobs/bucket, "
+            f"factor x{1.0 + plan['safety_factor']:.2f}, "
+            f"planned {plan['planned_total']} jobs)"
+        )
+    realized_none = evaluate_plan(
+        plan_none["n_machines"], factory, actual, FUTURE_HOURS
+    )
+    realized_p90 = evaluate_plan(
+        plan_p90["n_machines"], factory, actual, FUTURE_HOURS
+    )
+    realized_sf = evaluate_plan(
+        plan_sf["n_machines"], factory, actual, FUTURE_HOURS
     )
 
     # Naive plan: provision as if every future hour hits the historical peak.
@@ -97,7 +122,9 @@ def main() -> None:
 
     rows = [
         ("oracle (cheat)", oracle),
-        ("forecast plan", realized),
+        ("forecast, no margin", realized_none),
+        ("forecast + p90", realized_p90),
+        ("forecast + 20%", realized_sf),
         ("naive (peak-always)", naive),
     ]
     print(f"\n{'plan':<20} {'fleet':>5} {'cost/6h':>8} {'breach':>7}")
@@ -107,9 +134,9 @@ def main() -> None:
             f"${pt['cost']:>7.0f} {pt['breach_rate']:>6.1%}"
         )
 
-    err = cost_of_being_wrong(oracle, realized)
+    err = cost_of_being_wrong(oracle, realized_none)
     print(
-        f"\ncost of being wrong vs oracle: "
+        f"\ncost of being wrong vs oracle (no-margin plan): "
         f"${err['extra_cost']:+.0f} ({err['extra_cost_pct']:+.1f}%), "
         f"breach delta {err['breach_delta']:+.1%}"
     )
@@ -118,7 +145,7 @@ def main() -> None:
     names = [n for n, _ in rows]
     costs = [pt["cost"] for _, pt in rows]
     breaches = [pt["breach_rate"] for _, pt in rows]
-    colors = ["#2ca02c", "#1f77b4", "#d62728"]
+    colors = ["#2ca02c", "#1f77b4", "#17becf", "#9467bd", "#d62728"]
     fig, ax = plt.subplots(figsize=(8, 4.5))
     bars = ax.bar(names, costs, color=colors)
     ax.set_ylabel("realized fleet cost over 6h ($)")

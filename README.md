@@ -86,9 +86,30 @@ default seed the forecast plan lands one machine under the oracle (saving
 $24 but breaching 5.2% vs the 5% SLO) while the naive plan over-provisions
 by 25% — the shape of the tradeoff forecast error actually creates.
 
-Caveat, stated in the module docstring too: the planned workload is
-resampled, which smooths burstiness, so picks skew slightly optimistic —
-apply a safety margin in practice.
+### Safety margins
+
+Real planners never provision against the point forecast — they provision
+against an upper prediction interval. `plan_fleet` takes two composable
+margins, applied as `margined = (forecast + quantile_uplift) * (1 + factor)`:
+
+- `margin_quantile=0.9` — data-driven: after the holdout backtest, take
+  the p90 of residuals (actual − predicted, nearest-rank, floored at 0)
+  and add it to every forecast bucket. It adapts to how wrong *this*
+  forecaster is on *this* history.
+- `safety_factor=0.2` — policy: a flat +20% headroom on every bucket,
+  the "always carry an umbrella" rule. Stable and explainable; doesn't
+  depend on backtest luck.
+
+When to use which: the quantile margin is honest but jumpy — the holdout
+is only ~20% of history (3–4 buckets here), so one bad bucket swings it.
+The flat factor is dumber but steadier, and easier to defend in a capacity
+review ("we carry 20% headroom, here's the policy"). On the default
+workload the p90 margin is conservative (6 machines, $144, 0% breach vs
+the oracle's 4/$96) while the flat +20% lands exactly on the oracle
+(4 machines, $96, 2.6% breach). Both beat the no-margin plan's 5.2%
+breach; the price of the p90's extra certainty is visible in dollars.
+Diagnostics report everything applied: `margin_jobs_per_bucket`,
+`planned_counts`, and `margin_uplift_total`.
 
 ## Spot vs on-demand
 
